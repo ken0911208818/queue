@@ -3,23 +3,21 @@ package queue
 import (
 	"context"
 	"errors"
+
+	"github.com/golang-queue/queue/core"
 )
 
-var _ Worker = (*taskWorker)(nil)
+var _ core.Worker = (*taskWorker)(nil)
 
 // just for unit testing, don't use it.
 type taskWorker struct {
-	messages chan QueuedMessage
+	messages chan core.QueuedMessage
 }
 
-func (w *taskWorker) BeforeRun() error { return nil }
-func (w *taskWorker) AfterRun() error  { return nil }
-func (w *taskWorker) Run() error {
-	for msg := range w.messages {
-		if v, ok := msg.(Job); ok {
-			if v.Task != nil {
-				_ = v.Task(context.Background())
-			}
+func (w *taskWorker) Run(task core.QueuedMessage) error {
+	if v, ok := task.(Job); ok {
+		if v.Task != nil {
+			_ = v.Task(context.Background())
 		}
 	}
 	return nil
@@ -30,7 +28,7 @@ func (w *taskWorker) Shutdown() error {
 	return nil
 }
 
-func (w *taskWorker) Queue(job QueuedMessage) error {
+func (w *taskWorker) Queue(job core.QueuedMessage) error {
 	select {
 	case w.messages <- job:
 		return nil
@@ -38,6 +36,12 @@ func (w *taskWorker) Queue(job QueuedMessage) error {
 		return errors.New("max capacity reached")
 	}
 }
-func (w *taskWorker) Capacity() int       { return cap(w.messages) }
-func (w *taskWorker) Usage() int          { return len(w.messages) }
-func (w *taskWorker) BusyWorkers() uint64 { return uint64(0) }
+
+func (w *taskWorker) Request() (core.QueuedMessage, error) {
+	select {
+	case task := <-w.messages:
+		return task, nil
+	default:
+		return nil, ErrNoTaskInQueue
+	}
+}

@@ -1,10 +1,13 @@
 package queue
 
 import (
-	"context"
 	"testing"
 	"time"
 
+	"github.com/golang-queue/queue/core"
+	"github.com/golang-queue/queue/mocks"
+
+	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/goleak"
 )
@@ -21,12 +24,43 @@ func (m mockMessage) Bytes() []byte {
 	return []byte(m.message)
 }
 
-func TestNewQueue(t *testing.T) {
+func TestNewQueueWithZeroWorker(t *testing.T) {
+	controller := gomock.NewController(t)
+	defer controller.Finish()
+
 	q, err := NewQueue()
 	assert.Error(t, err)
 	assert.Nil(t, q)
 
-	w := &emptyWorker{}
+	w := mocks.NewMockWorker(controller)
+	w.EXPECT().Shutdown().Return(nil)
+	q, err = NewQueue(
+		WithWorker(w),
+		WithWorkerCount(0),
+	)
+	assert.NoError(t, err)
+	assert.NotNil(t, q)
+
+	q.Start()
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, 0, q.BusyWorkers())
+	q.Release()
+}
+
+func TestNewQueueWithDefaultWorker(t *testing.T) {
+	controller := gomock.NewController(t)
+	defer controller.Finish()
+
+	q, err := NewQueue()
+	assert.Error(t, err)
+	assert.Nil(t, q)
+
+	w := mocks.NewMockWorker(controller)
+	m := mocks.NewMockQueuedMessage(controller)
+	m.EXPECT().Bytes().Return([]byte("test")).AnyTimes()
+	w.EXPECT().Shutdown().Return(nil)
+	w.EXPECT().Request().Return(m, nil).AnyTimes()
+	w.EXPECT().Run(m).Return(nil).AnyTimes()
 	q, err = NewQueue(
 		WithWorker(w),
 	)
@@ -34,34 +68,13 @@ func TestNewQueue(t *testing.T) {
 	assert.NotNil(t, q)
 
 	q.Start()
-	assert.Equal(t, uint64(0), w.BusyWorkers())
-	q.Shutdown()
-	q.Wait()
-}
-
-func TestWorkerNum(t *testing.T) {
-	w := &messageWorker{
-		messages: make(chan QueuedMessage, 100),
-	}
-	q, err := NewQueue(
-		WithWorker(w),
-		WithWorkerCount(2),
-	)
-	assert.NoError(t, err)
-	assert.NotNil(t, q)
-
-	q.Start()
-	q.Start()
-	time.Sleep(20 * time.Millisecond)
-	assert.Equal(t, 4, q.Workers())
-	assert.Equal(t, uint64(0), w.BusyWorkers())
-	q.Shutdown()
-	q.Wait()
+	q.Release()
+	assert.Equal(t, 0, q.BusyWorkers())
 }
 
 func TestShtdonwOnce(t *testing.T) {
 	w := &messageWorker{
-		messages: make(chan QueuedMessage, 100),
+		messages: make(chan core.QueuedMessage, 100),
 	}
 	q, err := NewQueue(
 		WithWorker(w),
@@ -71,72 +84,17 @@ func TestShtdonwOnce(t *testing.T) {
 	assert.NotNil(t, q)
 
 	q.Start()
-	time.Sleep(20 * time.Millisecond)
-	assert.Equal(t, 2, q.Workers())
+	assert.Equal(t, 0, q.BusyWorkers())
 	q.Shutdown()
 	// don't panic here
 	q.Shutdown()
 	q.Wait()
-	assert.Equal(t, 0, q.Workers())
-}
-
-func TestWorkerStatus(t *testing.T) {
-	m := mockMessage{
-		message: "foobar",
-	}
-	w := &messageWorker{
-		messages: make(chan QueuedMessage, 100),
-	}
-	q, err := NewQueue(
-		WithWorker(w),
-		WithWorkerCount(2),
-	)
-	assert.NoError(t, err)
-	assert.NotNil(t, q)
-
-	assert.NoError(t, q.Queue(m))
-	assert.NoError(t, q.Queue(m))
-	assert.NoError(t, q.QueueWithTimeout(10*time.Millisecond, m))
-	assert.NoError(t, q.QueueWithTimeout(10*time.Millisecond, m))
-	assert.Equal(t, 100, q.Capacity())
-	assert.Equal(t, 4, q.Usage())
-	q.Start()
-	time.Sleep(20 * time.Millisecond)
-	q.Shutdown()
-	q.Wait()
-}
-
-func TestWorkerPanic(t *testing.T) {
-	w := &messageWorker{
-		messages: make(chan QueuedMessage, 10),
-	}
-	q, err := NewQueue(
-		WithWorker(w),
-		WithWorkerCount(5),
-	)
-	assert.NoError(t, err)
-	assert.NotNil(t, q)
-
-	assert.NoError(t, q.Queue(mockMessage{
-		message: "foobar",
-	}))
-	assert.NoError(t, q.Queue(mockMessage{
-		message: "foobar",
-	}))
-	assert.NoError(t, q.Queue(mockMessage{
-		message: "panic",
-	}))
-	q.Start()
-	time.Sleep(100 * time.Millisecond)
-	assert.Equal(t, 5, q.Workers())
-	q.Shutdown()
-	q.Wait()
-	assert.Equal(t, 0, q.Workers())
+	assert.Equal(t, 0, q.BusyWorkers())
 }
 
 func TestCapacityReached(t *testing.T) {
 	w := &messageWorker{
-		messages: make(chan QueuedMessage, 1),
+		messages: make(chan core.QueuedMessage, 1),
 	}
 	q, err := NewQueue(
 		WithWorker(w),
@@ -157,7 +115,7 @@ func TestCapacityReached(t *testing.T) {
 
 func TestCloseQueueAfterShutdown(t *testing.T) {
 	w := &messageWorker{
-		messages: make(chan QueuedMessage, 10),
+		messages: make(chan core.QueuedMessage, 10),
 	}
 	q, err := NewQueue(
 		WithWorker(w),
@@ -181,39 +139,4 @@ func TestCloseQueueAfterShutdown(t *testing.T) {
 	})
 	assert.Error(t, err)
 	assert.Equal(t, ErrQueueShutdown, err)
-}
-
-func TestQueueTaskJob(t *testing.T) {
-	w := &taskWorker{
-		messages: make(chan QueuedMessage, 10),
-	}
-	q, err := NewQueue(
-		WithWorker(w),
-		WithWorkerCount(5),
-		WithLogger(NewLogger()),
-	)
-	assert.NoError(t, err)
-	assert.NotNil(t, q)
-	q.Start()
-	assert.NoError(t, q.QueueTask(func(ctx context.Context) error {
-		time.Sleep(120 * time.Millisecond)
-		q.logger.Info("Add new task 1")
-		return nil
-	}))
-	assert.NoError(t, q.QueueTask(func(ctx context.Context) error {
-		time.Sleep(100 * time.Millisecond)
-		q.logger.Info("Add new task 2")
-		return nil
-	}))
-	assert.NoError(t, q.QueueTaskWithTimeout(50*time.Millisecond, func(ctx context.Context) error {
-		time.Sleep(80 * time.Millisecond)
-		return nil
-	}))
-	time.Sleep(50 * time.Millisecond)
-	assert.Equal(t, uint64(0), w.BusyWorkers())
-	q.Shutdown()
-	assert.Equal(t, ErrQueueShutdown, q.QueueTask(func(ctx context.Context) error {
-		return nil
-	}))
-	q.Wait()
 }

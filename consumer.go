@@ -7,43 +7,23 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/golang-queue/queue/core"
 )
 
-var _ Worker = (*Consumer)(nil)
+var _ core.Worker = (*Consumer)(nil)
 
 var errMaxCapacity = errors.New("max capacity reached")
 
-// Worker for simple queue using channel
+// Consumer for simple queue using buffer channel
 type Consumer struct {
-	taskQueue   chan QueuedMessage
-	runFunc     func(context.Context, QueuedMessage) error
-	stop        chan struct{}
-	logger      Logger
-	stopOnce    sync.Once
-	stopFlag    int32
-	busyWorkers uint64
-}
-
-func (s *Consumer) incBusyWorker() {
-	atomic.AddUint64(&s.busyWorkers, 1)
-}
-
-func (s *Consumer) decBusyWorker() {
-	atomic.AddUint64(&s.busyWorkers, ^uint64(0))
-}
-
-func (s *Consumer) BusyWorkers() uint64 {
-	return atomic.LoadUint64(&s.busyWorkers)
-}
-
-// BeforeRun run script before start worker
-func (s *Consumer) BeforeRun() error {
-	return nil
-}
-
-// AfterRun run script after start worker
-func (s *Consumer) AfterRun() error {
-	return nil
+	taskQueue chan core.QueuedMessage
+	runFunc   func(context.Context, core.QueuedMessage) error
+	stop      chan struct{}
+	exit      chan struct{}
+	logger    Logger
+	stopOnce  sync.Once
+	stopFlag  int32
 }
 
 func (s *Consumer) handle(job Job) error {
@@ -52,10 +32,8 @@ func (s *Consumer) handle(job Job) error {
 	panicChan := make(chan interface{}, 1)
 	startTime := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), job.Timeout)
-	s.incBusyWorker()
 	defer func() {
 		cancel()
-		s.decBusyWorker()
 	}()
 
 	// run the job
@@ -99,31 +77,23 @@ func (s *Consumer) handle(job Job) error {
 	}
 }
 
-// Run start the worker
-func (s *Consumer) Run() error {
-	// check queue status
-	select {
-	case <-s.stop:
-		return ErrQueueShutdown
-	default:
+// Run to execute new task
+func (s *Consumer) Run(task core.QueuedMessage) error {
+	var data Job
+	_ = json.Unmarshal(task.Bytes(), &data)
+	if v, ok := task.(Job); ok {
+		if v.Task != nil {
+			data.Task = v.Task
+		}
+	}
+	if err := s.handle(data); err != nil {
+		return err
 	}
 
-	for task := range s.taskQueue {
-		var data Job
-		_ = json.Unmarshal(task.Bytes(), &data)
-		if v, ok := task.(Job); ok {
-			if v.Task != nil {
-				data.Task = v.Task
-			}
-		}
-		if err := s.handle(data); err != nil {
-			s.logger.Error(err.Error())
-		}
-	}
 	return nil
 }
 
-// Shutdown worker
+// Shutdown the worker
 func (s *Consumer) Shutdown() error {
 	if !atomic.CompareAndSwapInt32(&s.stopFlag, 0, 1) {
 		return ErrQueueShutdown
@@ -132,40 +102,60 @@ func (s *Consumer) Shutdown() error {
 	s.stopOnce.Do(func() {
 		close(s.stop)
 		close(s.taskQueue)
+		if len(s.taskQueue) > 0 {
+			<-s.exit
+		}
 	})
 	return nil
 }
 
-// Capacity for channel
-func (s *Consumer) Capacity() int {
-	return cap(s.taskQueue)
-}
-
-// Usage for count of channel usage
-func (s *Consumer) Usage() int {
-	return len(s.taskQueue)
-}
-
-// Queue send notification to queue
-func (s *Consumer) Queue(job QueuedMessage) error {
+// Queue send task to the buffer channel
+func (s *Consumer) Queue(task core.QueuedMessage) error {
 	if atomic.LoadInt32(&s.stopFlag) == 1 {
 		return ErrQueueShutdown
 	}
 
 	select {
-	case s.taskQueue <- job:
+	case s.taskQueue <- task:
 		return nil
 	default:
 		return errMaxCapacity
 	}
 }
 
-// NewConsumer for struc
+// Request a new task from channel
+func (s *Consumer) Request() (core.QueuedMessage, error) {
+	clock := 0
+loop:
+	for {
+		select {
+		case task, ok := <-s.taskQueue:
+			if !ok {
+				select {
+				case s.exit <- struct{}{}:
+				default:
+				}
+				return nil, ErrQueueHasBeenClosed
+			}
+			return task, nil
+		case <-time.After(1 * time.Second):
+			if clock == 5 {
+				break loop
+			}
+			clock += 1
+		}
+	}
+
+	return nil, ErrNoTaskInQueue
+}
+
+// NewConsumer for create new consumer instance
 func NewConsumer(opts ...Option) *Consumer {
 	o := NewOptions(opts...)
 	w := &Consumer{
-		taskQueue: make(chan QueuedMessage, o.queueSize),
+		taskQueue: make(chan core.QueuedMessage, o.queueSize),
 		stop:      make(chan struct{}),
+		exit:      make(chan struct{}),
 		logger:    o.logger,
 		runFunc:   o.fn,
 	}
